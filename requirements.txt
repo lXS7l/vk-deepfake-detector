@@ -1,0 +1,21 @@
+# FastAPI и сервер
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+
+# База данных и окружение
+supabase
+python-dotenv
+
+# Компьютерное зрение и ML (строго под Python 3.10!)
+tensorflow==2.13.0
+numpy==1.24.3
+Pillow==10.1.0
+scikit-learn==1.3.2
+opencv-python
+keras-facenet
+mtcnn
+
+# Работа с видео
+yt-dlp
