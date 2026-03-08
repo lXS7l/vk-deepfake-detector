@@ -4,20 +4,19 @@ import shutil
 from pathlib import Path
 from typing import Literal, Optional
 
-
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel
 from yt_dlp import YoutubeDL
 
-# Добавляем импорт анализатора
+# Импортируем универсальный анализатор
 from analyzer.face_analyzer import DeepfakeAnalyzer
 
 load_dotenv()
 
-# Инициализируем анализатор (один раз при старте)
-analyzer = DeepfakeAnalyzer()
+# Инициализируем анализатор (с аудио)
+analyzer = DeepfakeAnalyzer(use_audio=True, audio_deep_model=False)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
@@ -44,7 +43,6 @@ class VideoInfo(BaseModel):
     thumbnail: str | None = None
 
 
-# Модель для ответа анализа
 class AnalysisResult(BaseModel):
     video_id: str
     status: Literal["success", "warning", "error"]
@@ -102,16 +100,9 @@ async def download_video(request: VideoDownloadRequest):
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
-        'external_downloader': 'aria2c',
-        'external_downloader_args': {
-            'aria2c': [
-                '-x', '16',      # Количество соединений к серверу (потоков)
-                '-k', '1M',      # Размер одного куска (1 МБ)
-                '--min-split-size', '1M',
-                '--max-connection-per-server', '16', # Макс. соединений на сервер
-                '--continue', 'true',
-            ]
-        },
+        # Для ускорения можно добавить внешний загрузчик, например aria2c
+        # "external_downloader": "aria2c",
+        # "external_downloader_args": {"aria2c": ["-x", "16", "-k", "1M"]},
     }
 
     try:
@@ -140,14 +131,11 @@ async def download_video(request: VideoDownloadRequest):
         raise HTTPException(status_code=500, detail=f"Ошибка скачивания видео: {str(e)}")
 
 
-# НОВЫЙ ЭНДПОИНТ: Анализ видео
 @app.post("/analyze/{video_id}", response_model=AnalysisResult)
 async def analyze_video(video_id: str, background_tasks: BackgroundTasks):
     """
-    Анализирует ранее скачанное видео на наличие дипфейков.
-    После анализа видео удаляется (если не нужно сохранять).
+    Анализирует ранее скачанное видео по video_id.
     """
-    # Ищем файл видео по ID
     video_files = list(TEMP_DIR.glob(f"{video_id}.*"))
     if not video_files:
         raise HTTPException(status_code=404, detail=f"Видео с ID {video_id} не найдено")
@@ -155,23 +143,16 @@ async def analyze_video(video_id: str, background_tasks: BackgroundTasks):
     video_path = str(video_files[0])
 
     try:
-        # Запускаем анализ
+        # Запускаем полный анализ
         result = analyzer.analyze_video(video_path)
-
-        # Добавляем ID видео в результат
         result["video_id"] = video_id
-
-        # Планируем удаление файла после ответа (чтоб не засорять диск)
         background_tasks.add_task(analyzer.cleanup_temp, video_path)
-
         return result
     except Exception as e:
-        # В случае ошибки тоже чистим
         background_tasks.add_task(analyzer.cleanup_temp, video_path)
         raise HTTPException(status_code=500, detail=f"Ошибка анализа: {str(e)}")
 
 
-# НОВЫЙ ЭНДПОИНТ: Быстрый тест (скачать + проанализировать за один раз)
 class AnalyzeRequest(BaseModel):
     vk_url: str
 
@@ -179,12 +160,10 @@ class AnalyzeRequest(BaseModel):
 @app.post("/analyze-url", response_model=AnalysisResult)
 async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTasks):
     """
-    Скачивает видео по ссылке и сразу анализирует.
-    Удобно для тестирования.
+    Скачивает видео по ссылке и сразу анализирует (лица + аудио).
     """
-    # 1. Скачиваем
     vk_url = request.vk_url
-    if not vk_url.startswith(("https://vk.com/", "https://m.vk.com/", "https://vkvideo.ru/")):
+    if not vk_url.startswith(("https://vk.com/", "https://m.vk.com/", "https://vkvideo.ru")):
         raise HTTPException(status_code=400, detail="Некорректная ссылка VK")
 
     file_id = str(uuid.uuid4())
@@ -196,6 +175,16 @@ async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTa
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
+        'external_downloader': 'aria2c',
+        'external_downloader_args': {
+            'aria2c': [
+                '-x', '16',  # Количество соединений к серверу (потоков)
+                '-k', '1M',  # Размер одного куска (1 МБ)
+                '--min-split-size', '1M',
+                '--max-connection-per-server', '16',  # Макс. соединений на сервер
+                '--continue', 'true',
+            ]
+        },
     }
 
     try:
@@ -211,11 +200,11 @@ async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTa
             if not Path(local_path).exists():
                 raise Exception("Файл не был создан")
 
-            # 2. Анализируем
+            # Полный анализ (видео + аудио)
             result = analyzer.analyze_video(local_path)
             result["video_id"] = file_id
 
-            # 3. Чистим
+            # Удаляем видео после ответа
             background_tasks.add_task(analyzer.cleanup_temp, local_path)
 
             return result
@@ -224,6 +213,30 @@ async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTa
         for f in TEMP_DIR.glob(f"{file_id}.*"):
             f.unlink()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+
+@app.post("/analyze-audio")
+async def analyze_audio(file: UploadFile = File(...)):
+    """
+    Отдельный эндпоинт для анализа только аудиофайла.
+    """
+    file_id = str(uuid.uuid4())
+    file_path = TEMP_DIR / f"{file_id}_{file.filename}"
+
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    try:
+        # Используем аудиоанализатор напрямую
+        from analyzer.audio_analyzer import AudioDeepfakeAnalyzer
+        audio_analyzer = AudioDeepfakeAnalyzer(use_deep_model=False)
+        result = audio_analyzer.analyze_audio_file(str(file_path))
+        result["file_id"] = file_id
+        return result
+    finally:
+        if file_path.exists():
+            file_path.unlink()
 
 
 if __name__ == "__main__":

@@ -19,3 +19,13 @@ mtcnn
 
 # Работа с видео
 yt-dlp
+
+# Анализ аудио
+librosa==0.10.1
+soundfile==0.12.1
+torch==2.1.0
+torchaudio==2.1.0
+transformers==4.35.0
+audiomentations==0.33.0
+pydub==0.25.1
+webrtcvad==2.0.10
