@@ -1,33 +1,31 @@
 import os
 import uuid
-import shutil
 from pathlib import Path
-from typing import Literal, Optional
-
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from yt_dlp import YoutubeDL
-
-# Импортируем универсальный анализатор
 from analyzer.face_analyzer import DeepfakeAnalyzer
+from fastapi import Query
+from cache import compute_video_hash, get_cached_result, save_cached_result
+import logging
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Инициализируем анализатор (с аудио)
-analyzer = DeepfakeAnalyzer(use_audio=True, audio_deep_model=False)
+analyzer = DeepfakeAnalyzer(use_audio=True)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
 
-if not all([SUPABASE_URL, SUPABASE_ANON_KEY, VK_ACCESS_TOKEN]):
+if not all([VK_ACCESS_TOKEN]):
     print("⚠️  ВНИМАНИЕ: Не все переменные окружения заданы.")
 
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
 
+allowed_urls = ("https://vk.com/", "https://m.vk.com/", "https://vkvideo.ru")
 app = FastAPI(title="AntiDeepfake VK Video Analyzer")
 
 
@@ -45,8 +43,8 @@ class VideoInfo(BaseModel):
 
 class AnalysisResult(BaseModel):
     video_id: str
-    status: Literal["success", "warning", "error"]
-    verdict: Literal["authentic", "suspicious", "deepfake", "insufficient_data"]
+    status: str
+    verdict: str
     message: str
     deepfake_probability: float
     details: dict
@@ -57,7 +55,6 @@ async def root():
     return {
         "message": "AntiDeepfake API работает",
         "env_check": {
-            "supabase_url": bool(SUPABASE_URL),
             "vk_token": bool(VK_ACCESS_TOKEN),
         },
     }
@@ -67,7 +64,6 @@ async def root():
 async def test_vk_token():
     if not VK_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="VK_ACCESS_TOKEN не задан")
-
     url = "https://api.vk.com/method/users.get"
     params = {
         "access_token": VK_ACCESS_TOKEN,
@@ -86,38 +82,28 @@ async def test_vk_token():
 
 @app.post("/download-video", response_model=VideoInfo)
 async def download_video(request: VideoDownloadRequest):
-    """Скачивает видео из VK"""
     vk_url = request.vk_url
-    if not vk_url.startswith(("https://vk.com/", "https://m.vk.com/", "https://vkvideo.ru")):
+    if not vk_url.startswith(allowed_urls):
         raise HTTPException(status_code=400, detail="Некорректная ссылка VK")
-
     file_id = str(uuid.uuid4())
     output_template = str(TEMP_DIR / f"{file_id}.%(ext)s")
-
     ydl_opts = {
         "outtmpl": output_template,
         "format": "best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
-        # Для ускорения можно добавить внешний загрузчик, например aria2c
-        # "external_downloader": "aria2c",
-        # "external_downloader_args": {"aria2c": ["-x", "16", "-k", "1M"]},
     }
-
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(vk_url, download=True)
-
             if info.get("requested_downloads"):
                 local_path = info["requested_downloads"][0]["filepath"]
             else:
                 ext = info.get("ext", "mp4")
                 local_path = str(TEMP_DIR / f"{file_id}.{ext}")
-
             if not Path(local_path).exists():
                 raise Exception("Файл не был создан")
-
             return VideoInfo(
                 video_id=file_id,
                 title=info.get("title", "Без названия"),
@@ -130,44 +116,23 @@ async def download_video(request: VideoDownloadRequest):
             f.unlink()
         raise HTTPException(status_code=500, detail=f"Ошибка скачивания видео: {str(e)}")
 
-
-@app.post("/analyze/{video_id}", response_model=AnalysisResult)
-async def analyze_video(video_id: str, background_tasks: BackgroundTasks):
+@app.post("/analyze-url")
+async def analyze_by_url(
+    request: VideoDownloadRequest,
+    background_tasks: BackgroundTasks,
+    force_refresh: bool = Query(False, description="Принудительно пересчитать и обновить кэш")
+):
     """
-    Анализирует ранее скачанное видео по video_id.
-    """
-    video_files = list(TEMP_DIR.glob(f"{video_id}.*"))
-    if not video_files:
-        raise HTTPException(status_code=404, detail=f"Видео с ID {video_id} не найдено")
-
-    video_path = str(video_files[0])
-
-    try:
-        # Запускаем полный анализ
-        result = analyzer.analyze_video(video_path)
-        result["video_id"] = video_id
-        background_tasks.add_task(analyzer.cleanup_temp, video_path)
-        return result
-    except Exception as e:
-        background_tasks.add_task(analyzer.cleanup_temp, video_path)
-        raise HTTPException(status_code=500, detail=f"Ошибка анализа: {str(e)}")
-
-
-class AnalyzeRequest(BaseModel):
-    vk_url: str
-
-
-@app.post("/analyze-url", response_model=AnalysisResult)
-async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTasks):
-    """
-    Скачивает видео по ссылке и сразу анализирует (лица + аудио).
+    Скачивает видео по ссылке, анализирует (лица + аудио) и кэширует результат.
+    Если force_refresh=True, кэш игнорируется и перезаписывается.
     """
     vk_url = request.vk_url
-    if not vk_url.startswith(("https://vk.com/", "https://m.vk.com/", "https://vkvideo.ru")):
+    if not vk_url.startswith(allowed_urls):
         raise HTTPException(status_code=400, detail="Некорректная ссылка VK")
 
     file_id = str(uuid.uuid4())
     output_template = str(TEMP_DIR / f"{file_id}.%(ext)s")
+    local_path = None
 
     ydl_opts = {
         "outtmpl": output_template,
@@ -175,22 +140,11 @@ async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTa
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
-        'external_downloader': 'aria2c',
-        'external_downloader_args': {
-            'aria2c': [
-                '-x', '16',  # Количество соединений к серверу (потоков)
-                '-k', '1M',  # Размер одного куска (1 МБ)
-                '--min-split-size', '1M',
-                '--max-connection-per-server', '16',  # Макс. соединений на сервер
-                '--continue', 'true',
-            ]
-        },
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(vk_url, download=True)
-
             if info.get("requested_downloads"):
                 local_path = info["requested_downloads"][0]["filepath"]
             else:
@@ -200,46 +154,44 @@ async def analyze_by_url(request: AnalyzeRequest, background_tasks: BackgroundTa
             if not Path(local_path).exists():
                 raise Exception("Файл не был создан")
 
-            # Полный анализ (видео + аудио)
+            # Вычисляем хеш видео
+            video_hash = compute_video_hash(local_path)
+
+            # Проверяем кэш, если не принудительно
+            if not force_refresh:
+                cached = get_cached_result(video_hash)
+                if cached:
+                    logger.info(f"Возвращён кэшированный результат для {video_hash}")
+                    # Планируем удаление временного файла
+                    background_tasks.add_task(analyzer.cleanup_temp, local_path)
+                    return cached
+
+            # Если кэша нет или force_refresh=True — анализируем
             result = analyzer.analyze_video(local_path)
             result["video_id"] = file_id
+            result["cached"] = False
 
-            # Удаляем видео после ответа
-            background_tasks.add_task(analyzer.cleanup_temp, local_path)
+            # Сохраняем в кэш
+            save_cached_result(video_hash, result)
 
             return result
 
     except Exception as e:
-        for f in TEMP_DIR.glob(f"{file_id}.*"):
-            f.unlink()
+        if local_path and Path(local_path).exists():
+            background_tasks.add_task(analyzer.cleanup_temp, local_path)
+        else:
+            for f in TEMP_DIR.glob(f"{file_id}.*"):
+                try:
+                    f.unlink()
+                except:
+                    pass
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-
-@app.post("/analyze-audio")
-async def analyze_audio(file: UploadFile = File(...)):
-    """
-    Отдельный эндпоинт для анализа только аудиофайла.
-    """
-    file_id = str(uuid.uuid4())
-    file_path = TEMP_DIR / f"{file_id}_{file.filename}"
-
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-
-    try:
-        # Используем аудиоанализатор напрямую
-        from analyzer.audio_analyzer import AudioDeepfakeAnalyzer
-        audio_analyzer = AudioDeepfakeAnalyzer(use_deep_model=False)
-        result = audio_analyzer.analyze_audio_file(str(file_path))
-        result["file_id"] = file_id
-        return result
     finally:
-        if file_path.exists():
-            file_path.unlink()
-
+        # Планируем удаление видео (если не произошло раньше)
+        if local_path and Path(local_path).exists():
+            background_tasks.add_task(analyzer.cleanup_temp, local_path)
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

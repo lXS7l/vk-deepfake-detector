@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import subprocess
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-import webrtcvad
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +29,6 @@ class AudioDeepfakeAnalyzer:
         # Параметры анализа
         self.sample_rate = 16000  # Гц, стандарт для речевых моделей
         self.frame_duration = 30  # мс для VAD
-        self.vad = webrtcvad.Vad(2)  # Уровень агрессивности 2 (средний)
-
         # Глубокие модели (загружаются только при необходимости)
         self.use_deep_model = use_deep_model
         self.wav2vec_processor = None
@@ -41,6 +38,13 @@ class AudioDeepfakeAnalyzer:
             self._load_deep_models()
 
         logger.info("Аудиоанализатор готов")
+
+    def _is_speech_rms(self, frame: bytes, sample_rate: int) -> bool:
+        audio = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        if len(audio) == 0:
+            return False
+        rms = np.sqrt(np.mean(audio ** 2))
+        return rms > 200
 
     def _load_deep_models(self):
         """Загружает Wav2Vec2 модель для глубокого анализа"""
@@ -188,7 +192,7 @@ class AudioDeepfakeAnalyzer:
                 if len(frame) < frame_length * 2:
                     break
 
-                is_speech = self.vad.is_speech(frame, sr)
+                is_speech = self._is_speech_rms(frame, sr)
                 total_frames += 1
 
                 if is_speech:
@@ -268,13 +272,7 @@ class AudioDeepfakeAnalyzer:
         return features
 
     def analyze_audio_file(self, audio_path: str) -> Dict:
-        """
-        Основной метод анализа аудиофайла.
-        Возвращает словарь с результатами.
-        """
         logger.info(f"Начало анализа аудио: {audio_path}")
-
-        # 1. Загружаем аудио
         audio = self.load_audio(audio_path)
         if audio is None:
             return {
@@ -285,18 +283,14 @@ class AudioDeepfakeAnalyzer:
                 "details": {}
             }
 
-        # 2. Извлекаем признаки
         spectral_features = self.extract_spectral_features(audio, self.sample_rate)
-        pause_features = self.analyze_pauses(audio, self.sample_rate)
+        # Временно отключаем анализ пауз
+        pause_features = {}  # self.analyze_pauses(audio, self.sample_rate)
         deep_features = self.analyze_with_wav2vec(audio, self.sample_rate)
 
-        # 3. Комбинируем все признаки
         all_features = {**spectral_features, **pause_features, **deep_features}
-
-        # 4. Простая эвристика для оценки (в реальном проекте здесь была бы ML-модель)
         deepfake_score = self._calculate_deepfake_score(all_features)
 
-        # 5. Формируем вердикт
         if deepfake_score < 0.3:
             verdict = "authentic"
             message = "Аудио выглядит подлинным"
