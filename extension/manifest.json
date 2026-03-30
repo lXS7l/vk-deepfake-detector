@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "AntiDeepfake VK Analyzer",
+  "version": "1.0",
+  "description": "Проверяет видео ВКонтакте на наличие дипфейков",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://vk.com/*", "*://m.vk.com/*", "*://vkvideo.ru/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
+  }
+}
